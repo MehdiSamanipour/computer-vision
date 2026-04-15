@@ -5,5 +5,7 @@
 			"path": "."
 		}
 	],
-	"settings": {}
+	"settings": {
+		"python.defaultInterpreterPath": "C:\\Users\\LEGION\\AppData\\Local\\Programs\\Python\\Python314\\python.exe"
+	}
 }
