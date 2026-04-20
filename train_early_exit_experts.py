@@ -9,6 +9,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
 from torchvision import datasets, transforms
 
+from dataset_download import download_caltech256
 from MobileNetV2 import build_early_exit_mobilenet_v2
 from distortion_utils import apply_distortion, distort_half_batch
 
@@ -31,8 +32,13 @@ def maybe_distort_batch(images: torch.Tensor, distortion_type: str, mode: str):
     if mode == "train":
         return distort_half_batch(images, distortion_type)
     out = images.clone()
+    fixed_sigma = None
+    if distortion_type == "blur":
+        fixed_sigma = 3
+    if distortion_type == "noise":
+        fixed_sigma = 20
     for i in range(out.size(0)):
-        out[i] = apply_distortion(out[i], distortion_type, sigma=None)
+        out[i] = apply_distortion(out[i], distortion_type, sigma=fixed_sigma)
     return out
 
 
@@ -55,7 +61,7 @@ def accuracy_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> float:
     return 100.0 * (preds == labels).float().mean().item()
 
 
-def run_epoch(model, loader, optimizer, criterion, device, expert_type, mode):
+def run_epoch(model, loader, optimizer, criterion, device, expert_type, mode, scaler):
     train_mode = mode == "train"
     if train_mode:
         model.train()
@@ -75,11 +81,13 @@ def run_epoch(model, loader, optimizer, criterion, device, expert_type, mode):
             optimizer.zero_grad()
 
         with torch.set_grad_enabled(train_mode):
-            outputs = model(images, expert_type=expert_type)
-            loss, _ = compute_multi_exit_loss(outputs, labels, criterion)
+            with torch.cuda.amp.autocast(enabled=device.type == "cuda"):
+                outputs = model(images, expert_type=expert_type)
+                loss, _ = compute_multi_exit_loss(outputs, labels, criterion)
             if train_mode:
-                loss.backward()
-                optimizer.step()
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
 
         cloud_acc = accuracy_from_logits(outputs["cloud"], labels)
         total_loss += loss.item()
@@ -132,7 +140,7 @@ def train_stage(
     checkpoint_path: str,
     train_backbone: bool,
 ):
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.02)
     if train_backbone:
         model.unfreeze_backbone()
         params = model.parameters()
@@ -143,13 +151,14 @@ def train_stage(
     optimizer = optim.Adam(params, lr=lr, weight_decay=weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(epochs, 1))
     stopper = EarlyStopping(patience=patience)
+    scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
 
     for epoch in range(1, epochs + 1):
         train_loss, train_acc = run_epoch(
-            model, train_loader, optimizer, criterion, device, expert_type=expert_type, mode="train"
+            model, train_loader, optimizer, criterion, device, expert_type=expert_type, mode="train", scaler=scaler
         )
         val_loss, val_acc = run_epoch(
-            model, val_loader, optimizer, criterion, device, expert_type=expert_type, mode="val"
+            model, val_loader, optimizer, criterion, device, expert_type=expert_type, mode="val", scaler=scaler
         )
         scheduler.step()
         improved = stopper.update(val_loss)
@@ -163,43 +172,88 @@ def train_stage(
             print("[%s] early stopping at epoch %d" % (expert_type, epoch))
             break
 
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["model_state_dict"])
 
 
 def main():
     parser = argparse.ArgumentParser(description="Train early-exit MobileNetV2 with expert branches.")
-    parser.add_argument("--dataset_root", required=True, help="ImageFolder root for pristine training images.")
-    parser.add_argument("--num_classes", type=int, required=True)
+    parser.add_argument("--dataset_root", default="", help="ImageFolder root for pristine training images.")
+    parser.add_argument(
+        "--download_caltech256",
+        action="store_true",
+        help="Download Caltech256 with kagglehub before training.",
+    )
+    parser.add_argument(
+        "--dataset_download_path",
+        default="",
+        help="Optional directory to copy downloaded Caltech256 dataset.",
+    )
+    parser.add_argument("--num_classes", type=int, default=0, help="If 0, infer from dataset classes.")
     parser.add_argument("--save_dir", default="checkpoints")
     parser.add_argument("--input_size", type=int, default=224)
     parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--epochs_pristine", type=int, default=50)
-    parser.add_argument("--epochs_expert", type=int, default=30)
+    parser.add_argument("--epochs_pristine", type=int, nargs="?", const=50, default=50)
+    parser.add_argument("--epochs_expert", type=int, nargs="?", const=30, default=30)
     parser.add_argument("--lr_fc", type=float, default=1e-2)
     parser.add_argument("--lr_expert", type=float, default=1e-2)
     parser.add_argument("--weight_decay", type=float, default=5e-4)
     parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--num_workers", type=int, default=4)
     args = parser.parse_args()
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+        torch.backends.cudnn.benchmark = True
     os.makedirs(args.save_dir, exist_ok=True)
 
-    transform = transforms.Compose(
+    if args.download_caltech256:
+        args.dataset_root = download_caltech256(args.dataset_download_path)
+    if not args.dataset_root:
+        raise ValueError("Provide --dataset_root or use --download_caltech256.")
+
+    train_transform = transforms.Compose(
+        [
+            transforms.RandomResizedCrop(args.input_size, scale=(0.8, 1.0)),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+        ]
+    )
+    eval_transform = transforms.Compose(
         [
             transforms.Resize((args.input_size, args.input_size)),
             transforms.ToTensor(),
         ]
     )
-    dataset = datasets.ImageFolder(root=args.dataset_root, transform=transform)
+    dataset = datasets.ImageFolder(root=args.dataset_root, transform=train_transform)
+    if args.num_classes <= 0:
+        args.num_classes = len(dataset.classes)
+    print("Detected classes:", len(dataset.classes))
+    print("Using num_classes:", args.num_classes)
+
     train_set, val_set, test_set = split_dataset(dataset, seed=args.seed)
-    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=2)
-    val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=2)
-    test_loader = DataLoader(test_set, batch_size=args.batch_size, shuffle=False, num_workers=2)
+    # Use deterministic eval transform for val/test.
+    val_set.dataset.transform = eval_transform
+    test_set.dataset.transform = eval_transform
+
+    pin_memory = torch.cuda.is_available()
+    val_loader = DataLoader(
+        val_set, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=pin_memory
+    )
+    test_loader = DataLoader(
+        test_set, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=pin_memory
+    )
+    train_loader = DataLoader(
+        train_set, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=pin_memory
+    )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Using device:", device)
+    if device.type == "cuda":
+        print("GPU:", torch.cuda.get_device_name(0))
     model = build_early_exit_mobilenet_v2(num_classes=args.num_classes, pretrained_backbone=True).to(device)
 
     # Stage 1: train pristine expert + backbone.
@@ -252,8 +306,9 @@ def main():
                 images = images.to(device)
                 labels = labels.to(device)
                 images = maybe_distort_batch(images, expert_type=expert_type, mode="test")
-                outputs = model(images, expert_type=expert_type)
-                loss = criterion(outputs["cloud"], labels)
+                with torch.cuda.amp.autocast(enabled=device.type == "cuda"):
+                    outputs = model(images, expert_type=expert_type)
+                    loss = criterion(outputs["cloud"], labels)
                 total_loss += loss.item()
                 total_acc += accuracy_from_logits(outputs["cloud"], labels)
                 n += 1

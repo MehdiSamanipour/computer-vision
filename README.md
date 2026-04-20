@@ -58,7 +58,24 @@ Install Python 3.8.10 and dependencies:
 
 ```bash
 python -m pip install --upgrade pip
-python -m pip install torch torchvision numpy pillow opencv-python
+python -m pip install torch torchvision numpy pillow opencv-python kagglehub
+```
+
+## Download Caltech256 to your path
+
+Use the standalone downloader:
+
+```bash
+python dataset_download.py --target_dir "C:\your\dataset\path"
+```
+
+Equivalent core code:
+
+```python
+import kagglehub
+
+path = kagglehub.dataset_download("jessicali9530/caltech256")
+print("Path to dataset files:", path)
 ```
 
 ## 1) Train distortion classifier
@@ -66,6 +83,29 @@ python -m pip install torch torchvision numpy pillow opencv-python
 ```bash
 python training_distortion_classifier.py ^
   --root_path "C:\path\to\dataset_root" ^
+  --save_path "checkpoints/distortion_classifier.pt" ^
+  --epochs 50 ^
+  --classifier_input_mode spectrum
+```
+
+For maximum distortion-classifier accuracy on your setup, use:
+
+```bash
+python training_distortion_classifier.py ^
+  --root_path "C:\path\to\dataset_root" ^
+  --save_path "checkpoints/distortion_classifier_rgb.pt" ^
+  --epochs 30 ^
+  --batch_size 96 ^
+  --classifier_input_mode rgb ^
+  --disable_amp
+```
+
+Or auto-download before training:
+
+```bash
+python training_distortion_classifier.py ^
+  --download_caltech256 ^
+  --dataset_download_path "C:\your\dataset\path" ^
   --save_path "checkpoints/distortion_classifier.pt"
 ```
 
@@ -74,9 +114,21 @@ python training_distortion_classifier.py ^
 ```bash
 python train_early_exit_experts.py ^
   --dataset_root "C:\path\to\dataset_root" ^
-  --num_classes 257 ^
+  --save_dir "checkpoints" ^
+  --epochs_pristine 50 ^
+  --epochs_expert 30
+```
+
+Or auto-download before training:
+
+```bash
+python train_early_exit_experts.py ^
+  --download_caltech256 ^
+  --dataset_download_path "C:\your\dataset\path" ^
   --save_dir "checkpoints"
 ```
+
+`--num_classes` is optional. If omitted or set to `0`, the script infers the class count from `ImageFolder`.
 
 Outputs:
 
@@ -93,6 +145,7 @@ python infer_adaptive_offloading.py ^
   --model_checkpoint "checkpoints/early_exit_all_experts.pt" ^
   --distortion_checkpoint "checkpoints/distortion_classifier.pt" ^
   --num_classes 257 ^
+  --classifier_input_mode spectrum ^
   --target_confidence 0.8
 ```
 

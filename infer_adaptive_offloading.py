@@ -31,11 +31,18 @@ def main():
     parser.add_argument("--num_classes", type=int, required=True)
     parser.add_argument("--target_confidence", type=float, default=0.8)
     parser.add_argument("--input_size", type=int, default=224)
+    parser.add_argument(
+        "--classifier_input_mode",
+        type=str,
+        default="spectrum",
+        choices=["spectrum", "rgb", "blend"],
+        help="Must match the DistortionNet training mode.",
+    )
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    distortion_model = DistortionNet(num_classes=3).to(device)
+    distortion_model = DistortionNet(num_classes=3, input_mode=args.classifier_input_mode).to(device)
     distortion_ckpt = torch.load(args.distortion_checkpoint, map_location=device)
     distortion_model.load_state_dict(distortion_ckpt["model_state_dict"])
     distortion_model.eval()

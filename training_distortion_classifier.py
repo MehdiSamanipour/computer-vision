@@ -1,17 +1,18 @@
 import argparse
 import os
 import random
-from typing import Tuple
+from typing import List, Tuple
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from PIL import Image
 from torch.utils.data import DataLoader, Dataset, random_split
 from torchvision import datasets, transforms
 
+from dataset_download import download_caltech256
 from distortionNet import DistortionNet
 from distortion_utils import apply_distortion
+from distortion_utils import BLUR_LEVELS, NOISE_LEVELS
 
 
 LABEL_TO_NAME = {0: "pristine", 1: "blur", 2: "noise"}
@@ -23,26 +24,39 @@ class DistortionClassificationDataset(Dataset):
     Each sample is randomly assigned to pristine/blur/noise.
     """
 
-    def __init__(self, base_dataset: Dataset, split: str = "train"):
+    def __init__(self, base_dataset: Dataset, split: str = "train", seed: int = 42):
         self.base_dataset = base_dataset
         self.split = split
+        self.seed = seed
+        self.eval_levels = self._build_eval_levels()
 
     def __len__(self) -> int:
-        return len(self.base_dataset)
+        # Expand each pristine image into three distortion labels.
+        return len(self.base_dataset) * 3
+
+    def _build_eval_levels(self) -> List[int]:
+        rnd = random.Random(self.seed + 1000)
+        levels = []
+        for idx in range(len(self)):
+            label = idx % 3
+            if label == 1:
+                levels.append(rnd.choice(BLUR_LEVELS))
+            elif label == 2:
+                levels.append(rnd.choice(NOISE_LEVELS))
+            else:
+                levels.append(0)
+        return levels
 
     def __getitem__(self, index: int) -> Tuple[torch.Tensor, int]:
-        image, _ = self.base_dataset[index]
-        label = random.randint(0, 2)
+        base_idx = index // 3
+        label = index % 3
+        image, _ = self.base_dataset[base_idx]
         distortion_name = LABEL_TO_NAME[label]
         if self.split == "train":
-            image = apply_distortion(image, distortion_name, sigma=None)
+            # Keep label fixed but vary severity each epoch for robustness.
+            image = apply_distortion(image, distortion_name)
         elif self.split in ("val", "test"):
-            # Keep deterministic behavior by fixed representative levels.
-            sigma = None
-            if distortion_name == "blur":
-                sigma = 3
-            if distortion_name == "noise":
-                sigma = 20
+            sigma = self.eval_levels[index]
             image = apply_distortion(image, distortion_name, sigma=sigma)
         return image, label
 
@@ -74,7 +88,7 @@ class EarlyStopping:
             self.stop = True
 
 
-def run_epoch(model, loader, optimizer, criterion, device, train_mode: bool):
+def run_epoch(model, loader, optimizer, criterion, device, train_mode: bool, scaler, use_amp: bool):
     if train_mode:
         model.train()
     else:
@@ -92,11 +106,17 @@ def run_epoch(model, loader, optimizer, criterion, device, train_mode: bool):
             optimizer.zero_grad()
 
         with torch.set_grad_enabled(train_mode):
-            logits = model(images)
-            loss = criterion(logits, labels)
+            with torch.cuda.amp.autocast(enabled=(device.type == "cuda" and use_amp)):
+                logits = model(images)
+                loss = criterion(logits, labels)
             if train_mode:
-                loss.backward()
-                optimizer.step()
+                if device.type == "cuda" and use_amp:
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    optimizer.step()
 
         total_loss += loss.item() * images.size(0)
         preds = torch.argmax(logits, dim=1)
@@ -110,7 +130,17 @@ def run_epoch(model, loader, optimizer, criterion, device, train_mode: bool):
 
 def main():
     parser = argparse.ArgumentParser(description="Train Fourier-spectrum distortion classifier.")
-    parser.add_argument("--root_path", required=True, help="Path to pristine dataset root (ImageFolder).")
+    parser.add_argument("--root_path", default="", help="Path to pristine dataset root (ImageFolder).")
+    parser.add_argument(
+        "--download_caltech256",
+        action="store_true",
+        help="Download Caltech256 with kagglehub before training.",
+    )
+    parser.add_argument(
+        "--dataset_download_path",
+        default="",
+        help="Optional directory to copy downloaded Caltech256 dataset.",
+    )
     parser.add_argument("--save_path", default="checkpoints/distortion_classifier.pt")
     parser.add_argument("--input_size", type=int, default=224)
     parser.add_argument("--batch_size", type=int, default=64)
@@ -119,11 +149,38 @@ def main():
     parser.add_argument("--weight_decay", type=float, default=5e-4)
     parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument(
+        "--no_pretrained_backbone",
+        action="store_true",
+        help="Disable ImageNet pretrained backbone in DistortionNet.",
+    )
+    parser.add_argument(
+        "--classifier_input_mode",
+        type=str,
+        default="spectrum",
+        choices=["spectrum", "rgb", "blend"],
+        help="Distortion classifier input representation.",
+    )
+    parser.add_argument(
+        "--disable_amp",
+        action="store_true",
+        help="Disable mixed precision training.",
+    )
     args = parser.parse_args()
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+        torch.backends.cudnn.benchmark = True
     os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
+
+    if args.download_caltech256:
+        args.root_path = download_caltech256(args.dataset_download_path)
+
+    if not args.root_path:
+        raise ValueError("Provide --root_path or use --download_caltech256.")
 
     transform = transforms.Compose(
         [
@@ -142,24 +199,57 @@ def main():
         generator=torch.Generator().manual_seed(args.seed),
     )
 
-    train_dataset = DistortionClassificationDataset(train_base, split="train")
-    val_dataset = DistortionClassificationDataset(val_base, split="val")
-    test_dataset = DistortionClassificationDataset(test_base, split="test")
+    train_dataset = DistortionClassificationDataset(train_base, split="train", seed=args.seed)
+    val_dataset = DistortionClassificationDataset(val_base, split="val", seed=args.seed + 1)
+    test_dataset = DistortionClassificationDataset(test_base, split="test", seed=args.seed + 2)
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=2)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2)
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2)
+    pin_memory = torch.cuda.is_available()
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=pin_memory,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=pin_memory,
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=pin_memory,
+    )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = DistortionNet(num_classes=3).to(device)
-    criterion = nn.CrossEntropyLoss()
+    print("Using device:", device)
+    if device.type == "cuda":
+        print("GPU:", torch.cuda.get_device_name(0))
+
+    model = DistortionNet(
+        num_classes=3,
+        pretrained_backbone=not args.no_pretrained_backbone,
+        input_mode=args.classifier_input_mode,
+    ).to(device)
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.02)
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2)
     stopper = EarlyStopping(patience=args.patience, save_path=args.save_path)
+    use_amp = not args.disable_amp
+    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda" and use_amp))
 
     for epoch in range(1, args.epochs + 1):
-        train_loss, train_acc = run_epoch(model, train_loader, optimizer, criterion, device, train_mode=True)
-        val_loss, val_acc = run_epoch(model, val_loader, optimizer, criterion, device, train_mode=False)
+        train_loss, train_acc = run_epoch(
+            model, train_loader, optimizer, criterion, device, train_mode=True, scaler=scaler, use_amp=use_amp
+        )
+        val_loss, val_acc = run_epoch(
+            model, val_loader, optimizer, criterion, device, train_mode=False, scaler=scaler, use_amp=use_amp
+        )
         scheduler.step(val_loss)
         stopper(val_loss, model, optimizer, epoch)
         print(
@@ -170,9 +260,11 @@ def main():
             print("Early stopping at epoch %d" % epoch)
             break
 
-    checkpoint = torch.load(args.save_path, map_location=device)
+    checkpoint = torch.load(args.save_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["model_state_dict"])
-    test_loss, test_acc = run_epoch(model, test_loader, optimizer, criterion, device, train_mode=False)
+    test_loss, test_acc = run_epoch(
+        model, test_loader, optimizer, criterion, device, train_mode=False, scaler=scaler, use_amp=use_amp
+    )
     print("Test loss %.4f | Test acc %.2f%%" % (test_loss, test_acc))
 
 
