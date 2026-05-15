@@ -1,0 +1,15 @@
+{
+  "tag": "place_4_8_14",
+  "exit_indices": [
+    4,
+    8,
+    14
+  ],
+  "best_epoch": 38,
+  "best_val_policy_acc": 0.8228147148160648,
+  "best_val_avg_depth_cost_ratio": 0.8581096683659875,
+  "best_checkpoint": "outputs_gridsearch\\models\\place_4_8_14_best.pth",
+  "last_checkpoint": "outputs_gridsearch\\models\\place_4_8_14_last.pth",
+  "history_csv": "outputs_gridsearch\\csv\\place_4_8_14_history.csv",
+  "training_plot": "outputs_gridsearch\\plots\\place_4_8_14_training_curves.png"
+}

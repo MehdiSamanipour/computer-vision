@@ -1,0 +1,15 @@
+{
+  "tag": "place_2_5_10",
+  "exit_indices": [
+    2,
+    5,
+    10
+  ],
+  "best_epoch": 49,
+  "best_val_policy_acc": 0.8278771515356058,
+  "best_val_avg_depth_cost_ratio": 0.8718226548483934,
+  "best_checkpoint": "outputs_gridsearch\\models\\place_2_5_10_best.pth",
+  "last_checkpoint": "outputs_gridsearch\\models\\place_2_5_10_last.pth",
+  "history_csv": "outputs_gridsearch\\csv\\place_2_5_10_history.csv",
+  "training_plot": "outputs_gridsearch\\plots\\place_2_5_10_training_curves.png"
+}

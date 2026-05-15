@@ -1,0 +1,15 @@
+{
+  "tag": "place_7_12_17",
+  "exit_indices": [
+    7,
+    12,
+    17
+  ],
+  "best_epoch": 43,
+  "best_val_policy_acc": 0.8295646304421195,
+  "best_val_avg_depth_cost_ratio": 0.8749666944952661,
+  "best_checkpoint": "outputs_gridsearch\\models\\place_7_12_17_best.pth",
+  "last_checkpoint": "outputs_gridsearch\\models\\place_7_12_17_last.pth",
+  "history_csv": "outputs_gridsearch\\csv\\place_7_12_17_history.csv",
+  "training_plot": "outputs_gridsearch\\plots\\place_7_12_17_training_curves.png"
+}

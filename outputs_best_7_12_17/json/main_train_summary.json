@@ -1,0 +1,15 @@
+{
+  "tag": "main",
+  "exit_indices": [
+    7,
+    12,
+    17
+  ],
+  "best_epoch": 45,
+  "best_val_policy_acc": 0.8326020924738441,
+  "best_val_avg_depth_cost_ratio": 0.8774712684512496,
+  "best_checkpoint": "outputs_best_7_12_17\\models\\main_best.pth",
+  "last_checkpoint": "outputs_best_7_12_17\\models\\main_last.pth",
+  "history_csv": "outputs_best_7_12_17\\csv\\main_history.csv",
+  "training_plot": "outputs_best_7_12_17\\plots\\main_training_curves.png"
+}
